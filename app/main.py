@@ -23,8 +23,9 @@ from fastapi import FastAPI, HTTPException, Request, Body
 from fastapi.responses import JSONResponse
 from sqlalchemy import Column, String, Text, create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy.exc import IntegrityError
 
-load_dotenv(override=True)
+load_dotenv(override=False)
 AI_PIPE_TOKEN = os.getenv("AI_PIPE_TOKEN")
 AI_PIPE_MODEL = os.getenv("AI_PIPE_MODEL", "gpt-4.1-nano")
 AI_PIPE_CHAT_URL = os.getenv(
@@ -316,7 +317,7 @@ async def plan(payload, incident, catalog, policy):
     )
 
 
-    async with httpx.AsyncClient(timeout=13.0,trust_env=False) as client:
+    async with httpx.AsyncClient(timeout=16.0,trust_env=False) as client:
         try:
             r = await client.post(
                 os.getenv(
@@ -387,8 +388,15 @@ async def plan(payload, incident, catalog, policy):
         # except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
         #     raise HTTPException(502, "Planning service failed") from exc
     
+    if not isinstance(result, dict):
+        error("Planner returned a non-object", 502)
     cause = result.get("rootCause")
     ev = result.get("evidence", [])
+    # Repair formatting only; never invent evidence or silently substitute an ID.
+    if isinstance(ev, list):
+        ev = [x.strip().removeprefix("[").removesuffix("]").strip()
+              if isinstance(x, str) else x for x in ev]
+        result["evidence"] = ev
 
     valid_cause = cause in incident["allowedRootCauses"]
     valid_list = isinstance(ev, list)
@@ -440,14 +448,14 @@ async def plan(payload, incident, catalog, policy):
     #     error("Planner returned invalid diagnosis", 502)
 
     names = {t["name"] for t in catalog}
-    schemas = { t["name"]: t["inputSchema"]   for t in catalog}
+    schemas = {t["name"]: t.get("inputSchema", {}) for t in catalog}
 
     def validate_tool_args(tool_name, arguments):
         try:
             schema = schemas[tool_name]
             Draft202012Validator.check_schema(schema)
             Draft202012Validator(schemas[tool_name]).validate(arguments)
-        except (ValidationError, KeyError, ValueError) as exc:
+        except (ValidationError, SchemaError, KeyError, ValueError, TypeError) as exc:
             raise HTTPException(
                 status_code=502,
                 detail="Planner generated invalid tool arguments"
@@ -455,6 +463,8 @@ async def plan(payload, incident, catalog, policy):
     diagnostics = result.get("diagnostics", [])
     if not isinstance(diagnostics, list) or not (1 <= len(diagnostics) <= policy["maximumDiagnostics"]):
         error("Planner returned invalid diagnostics", 502)
+    if len({d.get("toolName") for d in diagnostics if isinstance(d, dict)}) != len(diagnostics):
+        error("Planner repeated a diagnostic tool", 502)
     for d in diagnostics:
         if not isinstance(d, dict) or d.get("toolName") not in names or d.get("toolName") in policy.get("effectTools", []) or not isinstance(d.get("arguments"), dict):
             error("Planner selected invalid diagnostic tool", 502)
@@ -712,11 +722,25 @@ async def create_incident(
         st["diagnosticIds"].append(dispatched["actionId"])
         st["dispatches"].append(dispatched)
     with Session() as db:
-        if db.get(Run, run_id):
-            error("Concurrent run creation; retry", 409)
+        existing = db.get(Run, run_id)
+        if existing:
+            if existing.request_hash != request_hash:
+                error("runId content conflict", 409)
+            return JSONResponse(public(json.loads(existing.state_json)))
         row = Run(run_id=run_id, request_hash=request_hash, state_json=canonical(st))
         db.add(row)
-        db.commit()
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            # A competing request may have inserted the same runId.
+            # Read the committed winner and apply normal replay/conflict rules.
+            winner = db.get(Run, run_id)
+            if winner is None:
+                raise
+            if winner.request_hash != request_hash:
+                error("runId content conflict", 409)
+            return JSONResponse(public(json.loads(winner.state_json)))
     return JSONResponse(public(st))
 
 @app.get("/v2/incidents/{run_id}")
@@ -736,7 +760,9 @@ async def receive_receipt(
         error("Invalid receipt")
     rid = body["receiptId"]
     with Session() as db:
-        row = db.get(Run, run_id)
+        # Lock the run until the receipt and its derived state are committed.
+        # PostgreSQL serializes concurrent receipt updates on this row.
+        row = db.query(Run).filter(Run.run_id == run_id).with_for_update().one_or_none()
         if not row:
             error("Run not found", 404)
         st = json.loads(row.state_json)
@@ -789,7 +815,7 @@ async def receive_receipt(
                 if item.get("callId") != d["callId"] or item.get("attempt") != d["attempt"] or not item.get("nonce"):
                     error("Outcome correlation mismatch")
                 code = item.get("status")
-                if not isinstance(code, int) or not (code == 0 or 100 <= code <= 599):
+                if type(code) is not int or not (code == 0 or 100 <= code <= 599):
                     error("Invalid outcome status")
             retry = []
             for item in outcomes:
@@ -810,7 +836,7 @@ async def receive_receipt(
                     else:
                         st["effectFailed"] = True
             st["dispatches"] = retry
-            if not retry:
+            if not st["pending"]:
                 advance(st)
         response = public(st)
         st["receiptHashes"][rid] = {"hash": h, "response": copy.deepcopy(response)}
