@@ -399,20 +399,36 @@ async def plan(payload, incident, catalog, policy):
                     },
                 )
                 r.raise_for_status()
-                content = r.json()["choices"][0]["message"]["content"]
-                result = json.loads(content)
             except httpx.HTTPStatusError as exc:
                 print("AI PIPE HTTP ERROR:", exc.response.status_code, flush=True)
                 raise HTTPException(502, "AI planning provider returned an HTTP error") from exc
             except httpx.RequestError as exc:
                 print("AI PIPE CONNECTION ERROR:", type(exc).__name__, flush=True)
                 raise HTTPException(502, "AI planning provider connection failed") from exc
-            except (ValueError, KeyError, TypeError) as exc:
-                print("AI PIPE RESPONSE ERROR:", type(exc).__name__, flush=True)
-                raise HTTPException(502, "AI planning provider returned an invalid response") from exc
 
-            if not isinstance(result, dict):
-                error("Planner returned a non-object", 502)
+            # A syntactically invalid provider response is retryable, just like
+            # an invalid proposal. Do not print provider content or secrets.
+            try:
+                envelope = r.json()
+                content = envelope["choices"][0]["message"]["content"]
+                if not isinstance(content, str) or not content.strip():
+                    raise ValueError("empty_content")
+                result = json.loads(content)
+                if not isinstance(result, dict):
+                    raise ValueError("non_object_proposal")
+            except (ValueError, KeyError, TypeError, IndexError) as exc:
+                reason = (str(exc) if str(exc) in ("empty_content", "non_object_proposal")
+                          else "invalid_json_or_envelope")
+                planner_debug("provider_response_invalid", attempt=planner_attempt + 1, reason=reason)
+                if planner_attempt == 1:
+                    raise HTTPException(502, "AI planning provider returned an invalid response") from exc
+                messages.append({"role": "user", "content": (
+                    "Your previous response was not a valid JSON proposal (" + reason + "). "
+                    "Return exactly one COMPLETE JSON object matching the requested format, "
+                    "without markdown or explanations."
+                )})
+                continue
+
             cause = result.get("rootCause")
             ev = result.get("evidence", [])
             if isinstance(ev, list):
@@ -437,6 +453,7 @@ async def plan(payload, incident, catalog, policy):
                 validUnique=valid_unique, validIds=valid_ids,
                 errorCount=len(validation_errors),
                 errorKinds=["schema" if "arguments" in e else "proposal" for e in validation_errors],
+                errorRules=validation_errors[:10],
             )
             if planner_attempt == 1:
                 error("Planner returned invalid proposal after retry", 502)
@@ -604,12 +621,16 @@ class ToolInput(BaseModel):
     description: str
     inputSchema: dict[str, Any]
 
+    model_config = ConfigDict(extra="allow")
+
 
 class PolicyInput(BaseModel):
     maximumDiagnostics: int = Field(ge=1, le=3)
     effectTools: list[str]
     approvalRequiredFor: list[str]
     doNotExport: list[str] = Field(default_factory=list)
+
+    model_config = ConfigDict(extra="allow")
 
 
 class CreateIncidentInput(BaseModel):
@@ -621,6 +642,8 @@ class CreateIncidentInput(BaseModel):
     incident: IncidentInput
     toolCatalog: list[ToolInput]
     policy: PolicyInput
+
+    model_config = ConfigDict(extra="allow")
 
 
 # def debug_incident_summary(payload):
