@@ -122,6 +122,67 @@ def planner_debug(event, **fields):
     )
 
 
+def proposal_errors(result, incident, catalog, policy, evidence):
+    """Validate the complete model proposal; return safe, actionable errors."""
+    errors = []
+    if not isinstance(result, dict):
+        return ["Proposal must be a JSON object"]
+    cause = result.get("rootCause")
+    ev = result.get("evidence")
+    if cause not in incident["allowedRootCauses"]:
+        errors.append("rootCause must exactly match an allowed root cause")
+    if not isinstance(ev, list) or not all(isinstance(x, str) for x in ev):
+        errors.append("evidence must be an array of evidence ID strings")
+        ev = []
+    if not 2 <= len(ev) <= 4 or len(set(ev)) != len(ev):
+        errors.append("evidence must contain 2-4 distinct IDs")
+    if any(x not in evidence for x in ev):
+        errors.append("evidence contains IDs absent from the transcript allowlist")
+
+    tools = {t["name"]: t.get("inputSchema", {}) for t in catalog}
+    effects = policy.get("effectTools", [])
+
+    def check_tool(tool, label, must_effect):
+        if not isinstance(tool, dict):
+            errors.append(label + " must be an object")
+            return
+        name = tool.get("toolName")
+        if not isinstance(name, str) or name not in tools or (name in effects) != must_effect:
+            errors.append(label + " uses an unavailable or incorrectly classified tool")
+            return
+        args = tool.get("arguments")
+        if not isinstance(args, dict):
+            errors.append(label + " arguments must be an object")
+            return
+        schema = tools[name]
+        try:
+            Draft202012Validator.check_schema(schema)
+        except SchemaError:
+            # A malformed catalog is an input problem, not a model mistake.
+            error("Tool catalog contains an invalid JSON Schema", 422)
+        validator = Draft202012Validator(schema)
+        for violation in list(validator.iter_errors(args))[:5]:
+            path = ".".join(str(part) for part in violation.absolute_path) or "(root)"
+            errors.append(f"{label} {name} arguments at {path}: violated JSON Schema keyword {violation.validator}")
+
+    diagnostics = result.get("diagnostics")
+    if not isinstance(diagnostics, list) or not 1 <= len(diagnostics) <= policy["maximumDiagnostics"]:
+        errors.append("diagnostics must contain 1 to maximumDiagnostics entries")
+    else:
+        names = []
+        for i, diagnostic in enumerate(diagnostics):
+            check_tool(diagnostic, f"diagnostics[{i}]", False)
+            if isinstance(diagnostic, dict):
+                names.append(diagnostic.get("toolName"))
+                cited = diagnostic.get("evidence")
+                if not isinstance(cited, list) or not cited or not all(isinstance(x, str) for x in cited) or len(set(cited)) != len(cited) or not set(cited).issubset(ev):
+                    errors.append(f"diagnostics[{i}] evidence must be nonempty, unique, and included in top-level evidence")
+        if len(set(names)) != len(names):
+            errors.append("diagnostics must not repeat tool names")
+    check_tool(result.get("effect"), "effect", True)
+    return errors
+
+
 async def plan(payload, incident, catalog, policy):
     """Only first-seen runs invoke the model. Sensitive object is never forwarded."""
     token = os.getenv("AI_PIPE_TOKEN", "")
@@ -317,166 +378,87 @@ async def plan(payload, incident, catalog, policy):
     )
 
 
-    async with httpx.AsyncClient(timeout=16.0,trust_env=False) as client:
-        try:
-            r = await client.post(
-                os.getenv(
-                    "AI_PIPE_CHAT_URL",
-                    "https://aipipe.org/openai/v1/chat/completions"
+    # The grader uses large transcripts; a model may copy an evidence ID
+    # incorrectly even when given the complete allowlist. Retry once with
+    # explicit feedback, without inventing or replacing evidence ourselves.
+    messages = [
+        {"role": "system", "content": instructions},
+        {"role": "user", "content": canonical(safe)},
+    ]
+    result = None
+    async with httpx.AsyncClient(timeout=12.0, trust_env=False) as client:
+        for planner_attempt in range(2):
+            try:
+                r = await client.post(
+                    os.getenv("AI_PIPE_CHAT_URL", "https://aipipe.org/openai/v1/chat/completions"),
+                    headers={"Authorization": f"Bearer {token.strip()}"},
+                    json={
+                        "model": os.getenv("AI_PIPE_MODEL", "gpt-4.1-nano"),
+                        "temperature": 0,
+                        "messages": messages,
+                    },
+                )
+                r.raise_for_status()
+                content = r.json()["choices"][0]["message"]["content"]
+                result = json.loads(content)
+            except httpx.HTTPStatusError as exc:
+                print("AI PIPE HTTP ERROR:", exc.response.status_code, flush=True)
+                raise HTTPException(502, "AI planning provider returned an HTTP error") from exc
+            except httpx.RequestError as exc:
+                print("AI PIPE CONNECTION ERROR:", type(exc).__name__, flush=True)
+                raise HTTPException(502, "AI planning provider connection failed") from exc
+            except (ValueError, KeyError, TypeError) as exc:
+                print("AI PIPE RESPONSE ERROR:", type(exc).__name__, flush=True)
+                raise HTTPException(502, "AI planning provider returned an invalid response") from exc
+
+            if not isinstance(result, dict):
+                error("Planner returned a non-object", 502)
+            cause = result.get("rootCause")
+            ev = result.get("evidence", [])
+            if isinstance(ev, list):
+                ev = [x.strip().removeprefix("[").removesuffix("]").strip()
+                      if isinstance(x, str) else x for x in ev]
+                result["evidence"] = ev
+
+            valid_cause = cause in incident["allowedRootCauses"]
+            valid_list = isinstance(ev, list) and all(isinstance(x, str) for x in ev)
+            valid_count = valid_list and 2 <= len(ev) <= 4
+            valid_unique = valid_list and len(ev) == len(set(ev))
+            valid_ids = valid_list and all(x in evidence for x in ev)
+            # Validate the whole proposal *inside* the shared retry budget.
+            # This covers evidence IDs, diagnostic/effect tool names, required
+            # arguments, types, enums, ranges and additionalProperties.
+            validation_errors = proposal_errors(result, incident, catalog, policy, evidence)
+            if not validation_errors:
+                break
+            planner_debug(
+                "proposal_rejected", attempt=planner_attempt + 1,
+                validCause=valid_cause, validCount=valid_count,
+                validUnique=valid_unique, validIds=valid_ids,
+                errorCount=len(validation_errors),
+                errorKinds=["schema" if "arguments" in e else "proposal" for e in validation_errors],
+            )
+            if planner_attempt == 1:
+                error("Planner returned invalid proposal after retry", 502)
+            messages.append({"role": "assistant", "content": canonical(result)})
+            messages.append({
+                "role": "user",
+                "content": (
+                    "Your previous proposal failed validation. Correct these errors: "
+                    + canonical(validation_errors[:10])
+                    + ". Use ONLY allowed evidence IDs from the supplied transcript and allowed "
+                      "root causes. For each tool, obey its exact inputSchema: "
+                      "required fields, types, enum values, ranges, and additional "
+                      "properties restrictions. Use incident-supported identifiers. "
+                      "Return the COMPLETE corrected JSON proposal."
                 ),
-                headers={
-                    "Authorization": f"Bearer {token.strip()}"
-                },
-                json={
-                    "model": os.getenv("AI_PIPE_MODEL","gpt-4.1-nano"),
-                    "temperature": 0,
-                    "messages": [{ "role": "system","content": instructions },
-                        {"role": "user","content": canonical(safe) }]
-                }
-            )
+            })
 
-            r.raise_for_status()
-            content = r.json()["choices"][0]["message"]["content"]
-            result = json.loads(content)
-        # try:
-        #     r = await client.post(
-        #         os.getenv("AI_PIPE_CHAT_URL", "https://aipipe.org/openai/v1/chat/completions"),
-        #         headers={"Authorization": f"Bearer {token}"},
-        #         json={"model": os.getenv("AI_PIPE_MODEL", "gpt-4.1-nano"),
-        #               "temperature": 0, "response_format": {"type": "json_object"},
-        #               "messages": [{"role": "system", "content": instructions},
-        #                            {"role": "user", "content": canonical(safe)}]},
-        #     )
-        #     r.raise_for_status()
-        #     content = r.json()["choices"][0]["message"]["content"]
-        #     result = json.loads(content)
-        
-        except httpx.HTTPStatusError as exc:
-            print(
-                "AI PIPE HTTP ERROR:",
-                "status=", exc.response.status_code,
-                "url=", str(exc.request.url),
-                flush=True
-            )
-            raise HTTPException(
-                status_code=502,
-                detail="AI planning provider returned an HTTP error"
-            ) from exc
+    cause = result["rootCause"]
+    ev = result["evidence"]
+    diagnostics = result["diagnostics"]
+    effect = result["effect"]
 
-        except httpx.RequestError as exc:
-            print(
-                "AI PIPE CONNECTION ERROR:",
-                type(exc).__name__,
-                flush=True
-            )
-            raise HTTPException(
-                status_code=502,
-                detail="AI planning provider connection failed"
-            ) from exc
-
-        except (ValueError, KeyError, TypeError) as exc:
-            print(
-                "AI PIPE RESPONSE ERROR:",
-                type(exc).__name__,
-                flush=True
-            )
-            raise HTTPException(
-                status_code=502,
-                detail="AI planning provider returned an invalid response"
-            ) from exc
-    
-        # except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
-        #     raise HTTPException(502, "Planning service failed") from exc
-    
-    if not isinstance(result, dict):
-        error("Planner returned a non-object", 502)
-    cause = result.get("rootCause")
-    ev = result.get("evidence", [])
-    # Repair formatting only; never invent evidence or silently substitute an ID.
-    if isinstance(ev, list):
-        ev = [x.strip().removeprefix("[").removesuffix("]").strip()
-              if isinstance(x, str) else x for x in ev]
-        result["evidence"] = ev
-
-    valid_cause = cause in incident["allowedRootCauses"]
-    valid_list = isinstance(ev, list)
-
-    valid_count = valid_list and 2 <= len(ev) <= 4
-    valid_unique = valid_list and len(ev) == len(set(ev)) if (
-        valid_list and all(isinstance(x, str) for x in ev)
-    ) else False
-    valid_ids = valid_list and all(
-        isinstance(x, str) and x in evidence for x in ev
-    )
-
-    
-    if not all([valid_cause, valid_count, valid_unique, valid_ids]):
-        invalid_ids = (
-            [x for x in ev if x not in evidence]
-            if isinstance(ev, list)
-            else []
-        )
-
-        planner_debug(
-            "diagnosis_rejected",
-            validCause=valid_cause,
-            validCount=valid_count,
-            validUnique=valid_unique,
-            validIds=valid_ids,
-            invalidEvidenceCount=len(invalid_ids),
-            availableEvidenceCount=len(evidence)
-        )
-
-        error("Planner returned invalid diagnosis", 502)
-
-
-    # if not all([valid_cause, valid_count, valid_unique, valid_ids]):
-    #     print(
-    #         "PLANNER DIAGNOSIS VALIDATION:",
-    #         {
-    #             "rootCause": cause,
-    #             "allowedRootCauses": incident["allowedRootCauses"],
-    #             "returnedEvidence": ev,
-    #             "availableEvidence": evidence,
-    #             "validCause": valid_cause,
-    #             "validCount": valid_count,
-    #             "validUnique": valid_unique,
-    #             "validIds": valid_ids,
-    #         },
-    #         flush=True,
-    #     )
-    #     error("Planner returned invalid diagnosis", 502)
-
-    names = {t["name"] for t in catalog}
-    schemas = {t["name"]: t.get("inputSchema", {}) for t in catalog}
-
-    def validate_tool_args(tool_name, arguments):
-        try:
-            schema = schemas[tool_name]
-            Draft202012Validator.check_schema(schema)
-            Draft202012Validator(schemas[tool_name]).validate(arguments)
-        except (ValidationError, SchemaError, KeyError, ValueError, TypeError) as exc:
-            raise HTTPException(
-                status_code=502,
-                detail="Planner generated invalid tool arguments"
-            ) from exc
-    diagnostics = result.get("diagnostics", [])
-    if not isinstance(diagnostics, list) or not (1 <= len(diagnostics) <= policy["maximumDiagnostics"]):
-        error("Planner returned invalid diagnostics", 502)
-    if len({d.get("toolName") for d in diagnostics if isinstance(d, dict)}) != len(diagnostics):
-        error("Planner repeated a diagnostic tool", 502)
-    for d in diagnostics:
-        if not isinstance(d, dict) or d.get("toolName") not in names or d.get("toolName") in policy.get("effectTools", []) or not isinstance(d.get("arguments"), dict):
-            error("Planner selected invalid diagnostic tool", 502)
-        cited = d.get("evidence", [])
-        if not isinstance(cited, list) or not cited or len(cited) != len(set(cited)) or not set(cited).issubset(ev):
-            error("Planner returned invalid dispatch evidence", 502)
-        validate_tool_args(d["toolName"], d["arguments"])
-    effect = result.get("effect")
-    if not isinstance(effect, dict) or effect.get("toolName") not in policy.get("effectTools", []) or not isinstance(effect.get("arguments"), dict):
-        error("Planner selected invalid effect", 502)
-    validate_tool_args(effect["toolName"], effect["arguments"])
-    
     planner_debug(
         "proposal_accepted_locally",
         rootCause=cause,
