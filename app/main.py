@@ -15,7 +15,8 @@ from contextlib import asynccontextmanager
 from pydantic import BaseModel, Field, ConfigDict
 from typing import Any
 from dotenv import load_dotenv
-
+from jsonschema import Draft202012Validator, ValidationError
+from jsonschema.exceptions import SchemaError
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Body
@@ -249,6 +250,18 @@ async def plan(payload, incident, catalog, policy):
         error("Planner returned invalid diagnosis", 502)
 
     names = {t["name"] for t in catalog}
+    schemas = { t["name"]: t["inputSchema"]   for t in catalog}
+
+    def validate_tool_args(tool_name, arguments):
+        try:
+            schema = schemas[tool_name]
+            Draft202012Validator.check_schema(schema)
+            Draft202012Validator(schemas[tool_name]).validate(arguments)
+        except (ValidationError, KeyError, ValueError) as exc:
+            raise HTTPException(
+                status_code=502,
+                detail="Planner generated invalid tool arguments"
+            ) from exc
     diagnostics = result.get("diagnostics", [])
     if not isinstance(diagnostics, list) or not (1 <= len(diagnostics) <= policy["maximumDiagnostics"]):
         error("Planner returned invalid diagnostics", 502)
@@ -258,9 +271,11 @@ async def plan(payload, incident, catalog, policy):
         cited = d.get("evidence", [])
         if not isinstance(cited, list) or not cited or len(cited) != len(set(cited)) or not set(cited).issubset(ev):
             error("Planner returned invalid dispatch evidence", 502)
+        validate_tool_args(d["toolName"], d["arguments"])
     effect = result.get("effect")
     if not isinstance(effect, dict) or effect.get("toolName") not in policy.get("effectTools", []) or not isinstance(effect.get("arguments"), dict):
         error("Planner selected invalid effect", 502)
+    validate_tool_args(effect["toolName"], effect["arguments"])
     return {"rootCause": cause, "evidence": ev}, diagnostics, effect
 
 def attr(k, v):
@@ -417,6 +432,29 @@ async def create_incident(
 ):
     payload = payload_model.model_dump()
     incident, catalog, policy = validate(payload)
+    if os.getenv("DEBUG_PLANNER", "false").lower() == "true":
+        print(
+            "PLANNER DEBUG:",
+            json.dumps({
+                "runId": payload["runId"],
+                "allowedRootCauses": incident["allowedRootCauses"],
+                "toolCatalog": [
+                    {
+                        "name": t["name"],
+                        "inputFields": list(
+                            t.get("inputSchema", {}).get("properties", {}).keys()
+                        ),
+                        "requiredFields": t.get("inputSchema", {}).get("required", [])
+                       
+                    }
+                    for t in catalog
+                ],
+                "maximumDiagnostics": policy["maximumDiagnostics"],
+                "effectTools": policy.get("effectTools", []),
+                "approvalRequiredFor": policy.get("approvalRequiredFor", [])
+            }),
+            flush=True
+        )
     run_id = payload["runId"]
     request_hash = digest(payload)
     with Session() as db:
