@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: iitm-incident-agent-v2
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: DATABASE_URL
+        sync: false
+      - key: AI_PIPE_TOKEN
+        sync: false
+      - key: AI_PIPE_MODEL
+        value: gpt-4.1-nano
+      - key: AI_PIPE_CHAT_URL
+        value: https://aipipe.org/openai/v1/chat/completions
